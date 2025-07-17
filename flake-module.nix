@@ -40,7 +40,7 @@
   config = {
     perSystem = { config, self', inputs', pkgs, system, ... }:
       let
-        cfg = config.sops-precommit;
+        cfg = config.pre-commit.settings.hooks.sops-validator;
         buildHookArgs =
           [ "--ed25519-key" cfg.ed25519KeyPath ] ++
           (if cfg.pgpKey != null then [ "--pgp-key" cfg.pgpKey ] else []) ++
@@ -49,15 +49,14 @@
       in
       {
         precommit.settings.hooks.sops-validate = {
-          enable = true;
           name = "SOPS Secrets Validation";
           description = "Validate and re-encrypt SOPS secrets based on configuration";
-          entry = "${self'.packages.sops-precommit-hook}/bin/sops-precommit-hook";
-          files = cfg.filePattern;
+          entry = lib.mkDefault "${self'.packages.sops-precommit-hook}/bin/sops-precommit-hook";
+          files = lib.mkDefault cfg.filePattern;
           language = "system";
           pass_filenames = false;
           require_serial = true;
-          args = buildHookArgs;
+          args = lib.mkDefault buildHookArgs;
         };
       };
   };
