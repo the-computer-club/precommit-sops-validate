@@ -29,7 +29,6 @@ flake.nix in your project
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
       perSystem = { config, self', inputs', pkgs, system, ... }: {
-        # Enable SOPS pre-commit hook
         pre-commit = {
           check.enable = true;
           settings.hooks = {
@@ -44,18 +43,6 @@ flake.nix in your project
               settings.extraArgs = [ "--some-extra-arg" ];    # Optional: additional arguments
             };
           };
-        };
-
-        devShells.default = pkgs.mkShell {
-          inputsFrom = [
-            config.pre-commit.devShell
-            config.devShells.sops-precommit
-          ];
-
-          buildInputs = with pkgs; [
-            sops
-            age
-          ];
         };
       };
     };
