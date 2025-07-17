@@ -321,71 +321,71 @@ class SOPSValidator:
         except (subprocess.TimeoutExpired, Exception):
             return False
 
-def re_encrypt_file(self, file_path: str, env: Dict[str, str]):
-    """Re-encrypt a file with correct recipients."""
-    try:
-        # First decrypt the file
-        result = subprocess.run(
-            ['sops', '--decrypt', file_path],
-            capture_output=True,
-            env=env,
-            check=True,
-            timeout=30
-        )
-
-        # For binary files, we need to handle bytes
-        file_ext = os.path.splitext(file_path)[1].lower()
-        if file_ext in ['.keytab'] or 'keytab' in file_path.lower():
-            decrypted_content = result.stdout
-            mode = 'wb'
-        else:
-            decrypted_content = result.stdout
-            mode = 'w'
-
-        # Create temporary file with decrypted content
-        with tempfile.NamedTemporaryFile(
-            mode=mode,
-            delete=False,
-            suffix=os.path.splitext(file_path)[1]
-        ) as temp_file:
-            if mode == 'wb':
-                temp_file.write(decrypted_content.encode('utf-8') if isinstance(decrypted_content, str) else decrypted_content)
-            else:
-                temp_file.write(decrypted_content)
-            temp_path = temp_file.name
-
+    def re_encrypt_file(self, file_path: str, env: Dict[str, str]):
+        """Re-encrypt a file with correct recipients."""
         try:
-            # Re-encrypt with SOPS, using filename-override to ensure correct key group
-            subprocess.run(
-                ['sops', '--encrypt', '--in-place', '--filename-override', file_path, temp_path],
+            # First decrypt the file
+            result = subprocess.run(
+                ['sops', '--decrypt', file_path],
+                capture_output=True,
                 env=env,
                 check=True,
                 timeout=30
             )
 
-            # Replace original file
-            os.replace(temp_path, file_path)
+            # For binary files, we need to handle bytes
+            file_ext = os.path.splitext(file_path)[1].lower()
+            if file_ext in ['.keytab'] or 'keytab' in file_path.lower():
+                decrypted_content = result.stdout
+                mode = 'wb'
+            else:
+                decrypted_content = result.stdout
+                mode = 'w'
 
-            logger.info(f"Re-encrypted: {file_path}")
-            self.modified_files.append(file_path)
+            # Create temporary file with decrypted content
+            with tempfile.NamedTemporaryFile(
+                mode=mode,
+                delete=False,
+                suffix=os.path.splitext(file_path)[1]
+            ) as temp_file:
+                if mode == 'wb':
+                    temp_file.write(decrypted_content.encode('utf-8') if isinstance(decrypted_content, str) else decrypted_content)
+                else:
+                    temp_file.write(decrypted_content)
+                temp_path = temp_file.name
 
-        finally:
-            # Clean up temp file if it still exists
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+            try:
+                # Re-encrypt with SOPS, using filename-override to ensure correct key group
+                subprocess.run(
+                    ['sops', '--encrypt', '--in-place', '--filename-override', file_path, temp_path],
+                    env=env,
+                    check=True,
+                    timeout=30
+                )
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to re-encrypt {file_path}: {e}")
-        raise
-    except subprocess.TimeoutExpired:
-        logger.error(f"Timeout while re-encrypting {file_path}")
-        raise
+                # Replace original file
+                os.replace(temp_path, file_path)
+
+                logger.info(f"Re-encrypted: {file_path}")
+                self.modified_files.append(file_path)
+
+            finally:
+                # Clean up temp file if it still exists
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to re-encrypt {file_path}: {e}")
+            raise
+        except subprocess.TimeoutExpired:
+            logger.error(f"Timeout while re-encrypting {file_path}")
+            raise
 
     def unstage_file(self, file_path: str):
         """Unstage a file from git."""
         try:
             subprocess.run(['git', 'reset', 'HEAD', file_path],
-                         capture_output=True, check=True)
+                            capture_output=True, check=True)
         except subprocess.CalledProcessError:
             # File might not be staged, ignore error
             pass
