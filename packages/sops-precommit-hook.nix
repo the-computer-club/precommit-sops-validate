@@ -3,8 +3,7 @@
 buildPythonApplication rec {
   pname = "sops-precommit-hook";
   version = "1.0.0";
-
-  src = ./.;
+  src = ./..;
 
   propagatedBuildInputs = [
     pyyaml
