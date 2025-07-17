@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+# file: sops-precommit-hook
+"""
+SOPS Pre-commit Hook
+
+Validates and re-encrypts SOPS secrets based on .sops.yaml/.sops.json configuration.
+"""
+
+import argparse
+import json
+import yaml
+import os
+import sys
+import subprocess
+import re
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Union, Any
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class SOPSConfig:
+    """Handles SOPS configuration parsing and validation."""
+
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.config_data = self._load_config()
+
+    def _load_config(self) -> Dict[str, Any]:
+        """Load and validate SOPS configuration file."""
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"SOPS config file not found: {self.config_path}")
+
+        try:
+            with open(self.config_path, 'r') as f:
+                if self.config_path.endswith('.json'):
+                    return json.load(f)
+                else:  # Assume YAML
+                    return yaml.safe_load(f)
+        except (json.JSONDecodeError, yaml.YAMLError) as e:
+            raise ValueError(f"Invalid SOPS config format in {self.config_path}: {e}")
+
+    def get_creation_rules(self) -> List[Dict[str, Any]]:
+        """Get creation rules from SOPS config."""
+        return self.config_data.get('creation_rules', [])
+
+    def find_matching_rule(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Find the creation rule that matches the given file path."""
+        for rule in self.get_creation_rules():
+            if self._rule_matches_path(rule, file_path):
+                return rule
+        return None
+
+    def _rule_matches_path(self, rule: Dict[str, Any], file_path: str) -> bool:
+        """Check if a rule matches the given file path."""
+        # Check path_regex
+        if 'path_regex' in rule:
+            if re.match(rule['path_regex'], file_path):
+                return True
+
+        # Check path
+        if 'path' in rule:
+            # Simple glob-like matching
+            pattern = rule['path'].replace('*', '.*')
+            if re.match(pattern, file_path):
+                return True
+
+        return False
+
+
+class KeyManager:
+    """Handles key conversion and SOPS configuration."""
+
+    @staticmethod
+    def ed25519_to_age(ed25519_key_path: str) -> str:
+        """Convert ED25519 SSH key to AGE key."""
+        try:
+            # Use ssh-to-age tool to convert the key
+            result = subprocess.run(
+                ['ssh-to-age', '-private-key', '-i', ed25519_key_path],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to convert ED25519 key to AGE: {e}")
+            raise
+        except FileNotFoundError:
+            logger.error("ssh-to-age tool not found. Please install it.")
+            raise
+
+    @staticmethod
+    def is_ed25519_key(key_path: str) -> bool:
+        """Check if the key is an ED25519 key."""
+        try:
+            with open(key_path, 'r') as f:
+                content = f.read()
+                return 'BEGIN OPENSSH PRIVATE KEY' in content
+        except FileNotFoundError:
+            return False
+
+
+class SOPSValidator:
+    """Main SOPS validation and re-encryption logic."""
+
+    def __init__(self, ed25519_key: str = "/etc/ssh/ssh_host_ed25519_key",
+                 pgp_key: Optional[str] = None):
+        self.ed25519_key = ed25519_key
+        self.pgp_key = pgp_key
+        self.modified_files = []
+        self.sops_config = None
+
+        # Find SOPS config file
+        for config_name in ['.sops.yaml', '.sops.yml', '.sops.json']:
+            if os.path.exists(config_name):
+                self.sops_config = SOPSConfig(config_name)
+                break
+
+        if not self.sops_config:
+            raise FileNotFoundError("No SOPS configuration file found (.sops.yaml/.sops.json)")
+
+    def get_secret_files(self) -> List[str]:
+        """Find all potential secret files in the repository."""
+        secret_files = []
+
+        # Common secret file patterns
+        patterns = [
+            '**/*.yaml',
+            '**/*.yml',
+            '**/*.json',
+            '**/*.env'
+        ]
+
+        for pattern in patterns:
+            for file_path in Path('.').glob(pattern):
+                if self._is_sops_file(str(file_path)):
+                    secret_files.append(str(file_path))
+
+        return secret_files
+
+    def _is_sops_file(self, file_path: str) -> bool:
+        """Check if a file is encrypted with SOPS."""
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+                # Check for SOPS metadata
+                return 'sops:' in content and ('version:' in content or '"version"' in content)
+        except (UnicodeDecodeError, FileNotFoundError):
+            return False
+
+    def get_file_recipients(self, file_path: str) -> List[str]:
+        """Extract recipients from a SOPS-encrypted file."""
+        try:
+            # Try to get AGE recipients
+            result = subprocess.run(
+                ['sops', '--decrypt', '--extract', '["sops"]["age"]', file_path],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                age_data = self._parse_sops_output(result.stdout.strip(), file_path)
+                if isinstance(age_data, list):
+                    recipients = []
+                    for item in age_data:
+                        if isinstance(item, dict) and 'recipient' in item:
+                            recipients.append(item['recipient'])
+                    if recipients:
+                        return recipients
+
+            # Try to get PGP recipients
+            result = subprocess.run(
+                ['sops', '--decrypt', '--extract', '["sops"]["pgp"]', file_path],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                pgp_data = self._parse_sops_output(result.stdout.strip(), file_path)
+                if isinstance(pgp_data, list):
+                    recipients = []
+                    for item in pgp_data:
+                        if isinstance(item, dict) and 'fp' in item:
+                            recipients.append(item['fp'])
+                    if recipients:
+                        return recipients
+
+            return []
+
+        except Exception as e:
+            logger.warning(f"Could not extract recipients from {file_path}: {e}")
+            return []
+
+    def _parse_sops_output(self, output: str, file_path: str) -> Any:
+        """Parse SOPS output based on file type."""
+        file_ext = os.path.splitext(file_path)[1].lower()
+
+        try:
+            if file_ext in ['.json']:
+                return json.loads(output)
+            elif file_ext in ['.yaml', '.yml']:
+                return yaml.safe_load(output)
+            elif file_ext in ['.env', '.keytab', ''] or 'keytab' in file_path.lower():
+                # For env files and keytab files, SOPS might return the data in different formats
+                # Try JSON first, then YAML
+                try:
+                    return json.loads(output)
+                except json.JSONDecodeError:
+                    try:
+                        return yaml.safe_load(output)
+                    except yaml.YAMLError:
+                        # If both fail, try to parse as plain text
+                        # This might be needed for some edge cases
+                        return output
+            else:
+                # Default: try JSON first, then YAML
+                try:
+                    return json.loads(output)
+                except json.JSONDecodeError:
+                    return yaml.safe_load(output)
+
+        except (json.JSONDecodeError, yaml.YAMLError) as e:
+            logger.warning(f"Failed to parse SOPS output for {file_path}: {e}")
+            return None
+
+    def get_file_recipients(self, file_path: str) -> List[str]:
+        """Extract recipients from a SOPS-encrypted file."""
+        try:
+            result = subprocess.run(
+                ['sops', '--decrypt', '--extract', '["sops"]["age"]', file_path],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                # AGE recipients
+                age_data = yaml.safe_load(result.stdout)
+                if isinstance(age_data, list):
+                    return [item.get('recipient', '') for item in age_data]
+
+            # Try PGP recipients
+            result = subprocess.run(
+                ['sops', '--decrypt', '--extract', '["sops"]["pgp"]', file_path],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                pgp_data = yaml.safe_load(result.stdout)
+                if isinstance(pgp_data, list):
+                    return [item.get('fp', '') for item in pgp_data]
+
+            return []
+        except Exception as e:
+            logger.warning(f"Could not extract recipients from {file_path}: {e}")
+            return []
+
+    def get_expected_recipients(self, file_path: str) -> List[str]:
+        """Get expected recipients based on SOPS configuration."""
+        rule = self.sops_config.find_matching_rule(file_path)
+        if not rule:
+            return []
+
+        recipients = []
+
+        # AGE recipients
+        if 'age' in rule:
+            recipients.extend(rule['age'])
+
+        # PGP recipients
+        if 'pgp' in rule:
+            recipients.extend(rule['pgp'])
+
+        return recipients
+
+    def recipients_match(self, file_path: str) -> bool:
+        """Check if file recipients match expected recipients."""
+        actual = set(self.get_file_recipients(file_path))
+        expected = set(self.get_expected_recipients(file_path))
+
+        return actual == expected
+
+    def setup_sops_keys(self) -> Dict[str, str]:
+        """Setup SOPS environment with decryption keys."""
+        env = os.environ.copy()
+
+        # Setup AGE key if ED25519 key is provided
+        if self.ed25519_key and os.path.exists(self.ed25519_key):
+            if KeyManager.is_ed25519_key(self.ed25519_key):
+                try:
+                    age_key = KeyManager.ed25519_to_age(self.ed25519_key)
+                    # Create temporary file for AGE key
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.age') as f:
+                        f.write(age_key)
+                        env['SOPS_AGE_KEY_FILE'] = f.name
+                except Exception as e:
+                    logger.warning(f"Could not convert ED25519 key: {e}")
+
+        # Setup PGP key if provided
+        if self.pgp_key:
+            env['SOPS_PGP_FP'] = self.pgp_key
+
+        return env
+
+    def can_decrypt_file(self, file_path: str, env: Dict[str, str]) -> bool:
+        """Check if we can decrypt a file with available keys."""
+        try:
+            result = subprocess.run(
+                ['sops', '--decrypt', file_path],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, Exception):
+            return False
+
+def re_encrypt_file(self, file_path: str, env: Dict[str, str]):
+    """Re-encrypt a file with correct recipients."""
+    try:
+        # First decrypt the file
+        result = subprocess.run(
+            ['sops', '--decrypt', file_path],
+            capture_output=True,
+            env=env,
+            check=True,
+            timeout=30
+        )
+
+        # For binary files, we need to handle bytes
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if file_ext in ['.keytab'] or 'keytab' in file_path.lower():
+            decrypted_content = result.stdout
+            mode = 'wb'
+        else:
+            decrypted_content = result.stdout
+            mode = 'w'
+
+        # Create temporary file with decrypted content
+        with tempfile.NamedTemporaryFile(
+            mode=mode,
+            delete=False,
+            suffix=os.path.splitext(file_path)[1]
+        ) as temp_file:
+            if mode == 'wb':
+                temp_file.write(decrypted_content.encode('utf-8') if isinstance(decrypted_content, str) else decrypted_content)
+            else:
+                temp_file.write(decrypted_content)
+            temp_path = temp_file.name
+
+        try:
+            # Re-encrypt with SOPS, using filename-override to ensure correct key group
+            subprocess.run(
+                ['sops', '--encrypt', '--in-place', '--filename-override', file_path, temp_path],
+                env=env,
+                check=True,
+                timeout=30
+            )
+
+            # Replace original file
+            os.replace(temp_path, file_path)
+
+            logger.info(f"Re-encrypted: {file_path}")
+            self.modified_files.append(file_path)
+
+        finally:
+            # Clean up temp file if it still exists
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to re-encrypt {file_path}: {e}")
+        raise
+    except subprocess.TimeoutExpired:
+        logger.error(f"Timeout while re-encrypting {file_path}")
+        raise
+
+    def unstage_file(self, file_path: str):
+        """Unstage a file from git."""
+        try:
+            subprocess.run(['git', 'reset', 'HEAD', file_path],
+                         capture_output=True, check=True)
+        except subprocess.CalledProcessError:
+            # File might not be staged, ignore error
+            pass
+
+    def validate_and_fix(self):
+        """Main validation and fixing logic."""
+        logger.info("Setting up SOPS keys...")
+        env = self.setup_sops_keys()
+
+        logger.info("Finding secret files...")
+        secret_files = self.get_secret_files()
+
+        if not secret_files:
+            logger.info("No SOPS-encrypted files found.")
+            return
+
+        logger.info(f"Found {len(secret_files)} secret files to validate.")
+
+        for file_path in secret_files:
+            logger.info(f"Validating {file_path}...")
+
+            if self.recipients_match(file_path):
+                logger.info(f"✓ {file_path} recipients are correct")
+                continue
+
+            logger.warning(f"✗ {file_path} recipients don't match configuration")
+
+            if self.can_decrypt_file(file_path, env):
+                logger.info(f"Re-encrypting {file_path}...")
+                self.re_encrypt_file(file_path, env)
+                self.unstage_file(file_path)
+
+                # Verify the fix worked
+                if self.recipients_match(file_path):
+                    logger.info(f"✓ {file_path} successfully re-encrypted")
+                else:
+                    logger.error(f"✗ {file_path} still has incorrect recipients after re-encryption")
+            else:
+                logger.error(f"Cannot decrypt {file_path} with available keys")
+
+        # Clean up temporary AGE key file
+        if 'SOPS_AGE_KEY_FILE' in env:
+            try:
+                os.unlink(env['SOPS_AGE_KEY_FILE'])
+            except OSError:
+                pass
+
+    def print_summary(self):
+        """Print summary of modifications."""
+        if self.modified_files:
+            print("\nModified files (unstaged):")
+            for file_path in self.modified_files:
+                print(f"  {file_path}")
+            print(f"\nTotal files modified: {len(self.modified_files)}")
+        else:
+            print("\nNo files were modified.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SOPS pre-commit hook for validating and re-encrypting secrets"
+    )
+    parser.add_argument(
+        '--ed25519-key',
+        default='/etc/ssh/ssh_host_ed25519_key',
+        help='Path to ED25519 SSH key for decryption (default: /etc/ssh/ssh_host_ed25519_key)'
+    )
+    parser.add_argument(
+        '--pgp-key',
+        help='PGP key fingerprint for decryption'
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    try:
+        validator = SOPSValidator(
+            ed25519_key=args.ed25519_key,
+            pgp_key=args.pgp_key
+        )
+
+        validator.validate_and_fix()
+        validator.print_summary()
+
+        # Exit with error code if files were modified
+        sys.exit(1 if validator.modified_files else 0)
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
